@@ -1,0 +1,6 @@
+{
+  "name": "claude-code-image-view",
+  "description": "Claude Code mod that shows images inline in the terminal (Read results and Markdown images in replies)",
+  "owner": { "name": "yu1745" },
+  "plugins": [{ "name": "image-view", "source": "./" }]
+}

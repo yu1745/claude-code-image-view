@@ -1,0 +1,4 @@
+{
+  "description": "Read 图片的展开按钮、回复中 Markdown 图片的内联显示，以及告诉模型用 ![](绝对路径) 交付图片的提示词段",
+  "modules": ["./register.tsx"]
+}

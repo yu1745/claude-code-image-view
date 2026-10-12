@@ -1,0 +1,6 @@
+{
+  "name": "image-view",
+  "version": "0.1.1",
+  "description": "在终端里显示图片：Read 读到的图片可点击展开，展开后可放大缩小显示区域，回复里的 ![](路径) 直接显示（需要支持 kitty 图片协议的终端）",
+  "author": { "name": "wangyu" }
+}
