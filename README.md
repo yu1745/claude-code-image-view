@@ -12,7 +12,7 @@ Claude Code 的一个 mod：**在终端里直接显示图片**。
 
 | 依赖 | 说明 |
 |---|---|
-| Claude Code | 带 mod / plugin 能力的版本（`/plugin` 命令可用） |
+| Claude Code | **≥ 2.1.287**（该版本起支持 Claude Mods，见 changelog）；已在 2.1.296 上验证，更早的版本未测试 |
 | 支持 kitty 图片协议的终端 | kitty、Ghostty 等；其他终端只显示 alt 文字 |
 | ImageMagick | 需要 `identify` 和 `convert` 命令；纯 PNG 且 ≤2 MiB 的图也要用 `identify` 读尺寸 |
 

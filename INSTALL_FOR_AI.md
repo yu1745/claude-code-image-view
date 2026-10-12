@@ -19,6 +19,8 @@ echo "$TERM $TERM_PROGRAM $KITTY_WINDOW_ID"   # hint only
 claude --version
 ```
 
+- Claude Code must be **>= 2.1.287** (first version with Claude Mods; verified on 2.1.296). If `claude --version`
+  is older, tell the user to upgrade first and stop.
 - If `identify` or `convert` is missing, tell the user and ask before installing ImageMagick
   (`sudo apt install imagemagick` / `brew install imagemagick`). Installing system packages needs their approval.
 - The terminal must support the kitty graphics protocol (kitty, Ghostty, ...). You cannot reliably detect this;
