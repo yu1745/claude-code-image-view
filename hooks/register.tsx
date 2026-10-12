@@ -5,8 +5,20 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|svg|avif|heic|ico)$/i
 // ![alt](path) / ![alt](<path with spaces>)，可带 "title"
 const MD_IMAGE = /!\[([^\]\n]*)\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"\n]*")?\s*\)/g
 const CACHE_DIR = '/tmp/cc-image-view'
-// Image 元素直接传的 PNG 数据上限是 2 MiB（解码后）
-const MAX_PNG_BYTES = 2 * 1024 * 1024
+// 图片有两种交给终端的方式：
+//  file   只传文件路径，由终端自己读取解码：原图画质，不占引擎的字节预算（默认，本机终端）
+//  inline 把 PNG 的 base64 放进渲染树：终端读不到这台机器的文件时（ssh）用，受下面的预算限制
+// 引擎限制：一棵渲染树里所有 inline Image 的 source 加起来不超过 2 MiB，超了整棵树会被丢弃。
+// 按 base64 长度保守计，一次渲染（一条回复 / 一组 Read）共用这一份预算
+const TREE_IMAGE_BUDGET = 2 * 1024 * 1024
+// inline：单张 PNG 上限（解码后）。取小一点，一条回复里才放得下几张；超过就继续缩小
+const MAX_PNG_BYTES = 700 * 1024
+// inline：缩小的边长梯度
+const RESIZE_EDGES = [1200, 900, 700, 500, 350]
+// file：非 PNG 转换时的最长边，只为避免超大图拖慢终端解码
+const FILE_MAX_EDGE = 2400
+// file 来源的路径最长 3072 字节，超过就退回 inline
+const MAX_FILE_PATH_BYTES = 3072
 const MAX_COLUMNS = 80
 // 默认高度的绝对上限；实际上限随终端行数走：视口行数 / ROWS_DIVISOR，至少 MIN_ROWS
 const MAX_ROWS = 30
@@ -20,10 +32,18 @@ const MAX_CELLS = 255
 
 type Prepared =
   | { state: 'loading' }
-  | { state: 'ready'; png: string; width: number; height: number }
+  | { state: 'ready'; source: PngSource; width: number; height: number }
   | { state: 'error'; message: string }
 
 type Engine = EngineInterface
+type PngSource = { png: string } | { file: string; format: 'png'; generation: number }
+// 消息当前在不在视口里：null 表示在视口外（只在全屏布局下有值）
+type OnScreen = { first: number; last: number; of: number } | null | undefined
+// 一棵树里还能放多少 Image source（base64 长度）；每次渲染新建一份，画图时扣减
+type Budget = { left: number }
+const newBudget = (): Budget => ({ left: TREE_IMAGE_BUDGET })
+
+const onScreenOf = (props: object): OnScreen => (props as { onScreen?: OnScreen }).onScreen
 
 const basename = (p: string) => p.slice(p.lastIndexOf('/') + 1)
 
@@ -36,22 +56,72 @@ async function identify($: Engine, path: string) {
   return { width: Number(w), height: Number(h), format: format ?? '' }
 }
 
-/** 读出（必要时转换、缩小）成 PNG 的 base64 */
+// file / inline / auto；auto 在 ssh 会话里用 inline（终端读不到这台机器的文件）
+type SourceMode = 'auto' | 'file' | 'inline'
+const SOURCE_MODES: readonly SourceMode[] = ['auto', 'file', 'inline']
+const SOURCE_MODE_KEY = 'imageSource'
+let sourceMode: SourceMode | undefined
+
+const describeSource = (mode: SourceMode) => ({
+  auto: '图片来源：auto（本机终端传文件路径，ssh 会话里内联 base64）',
+  file: '图片来源：file（传文件路径，原图画质；终端必须能读到这台机器的文件）',
+  inline: '图片来源：inline（内联 base64，会缩小到总量预算内）',
+})[mode]
+
+async function loadSourceMode($: Engine): Promise<SourceMode> {
+  if (sourceMode) return sourceMode
+  const stored = await $.store.get(SOURCE_MODE_KEY)
+  sourceMode = SOURCE_MODES.find(m => m === stored) ?? 'auto'
+  return sourceMode
+}
+
+async function useInline($: Engine): Promise<boolean> {
+  const mode = await loadSourceMode($)
+  if (mode !== 'auto') return mode === 'inline'
+  const r = await $.process.run(['sh', '-c', 'printf %s "$SSH_CONNECTION$SSH_TTY"'])
+  return r.exitCode === 0 && r.stdout.trim() !== ''
+}
+
+const hex = async (text: string) => {
+  const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text))
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** 准备好终端能显示的 PNG：file 来源是一个 PNG 文件路径，inline 来源是缩小后的 base64 */
 async function toPng($: Engine, path: string): Promise<Prepared> {
   const info = await identify($, path)
   const { size } = await $.fs.stat(path)
-  if (info.format === 'PNG' && size <= MAX_PNG_BYTES) {
-    const { base64 } = await $.fs.read(path, { as: 'bytes' })
-    return { state: 'ready', png: base64, width: info.width, height: info.height }
+  const inline = (await useInline($)) || new TextEncoder().encode(path).length > MAX_FILE_PATH_BYTES
+
+  if (!inline) {
+    if (info.format === 'PNG') {
+      return {
+        state: 'ready', width: info.width, height: info.height,
+        source: { file: path, format: 'png', generation: size },
+      }
+    }
+    const out = `${CACHE_DIR}/${await hex(`${path}:${size}:file`)}.png`
+    await $.process.run(['mkdir', '-p', CACHE_DIR])
+    const r = await $.process.run([
+      'convert', `${path}[0]`, '-resize', `${FILE_MAX_EDGE}x${FILE_MAX_EDGE}>`, '-strip', `png:${out}`,
+    ], { timeoutMs: 60_000 })
+    if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `convert 失败 (${r.exitCode})`)
+    const converted = await identify($, out)
+    return {
+      state: 'ready', width: converted.width, height: converted.height,
+      source: { file: out, format: 'png', generation: (await $.fs.stat(out)).size },
+    }
   }
 
-  const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(`${path}:${size}`))
-  const name = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
-  const out = `${CACHE_DIR}/${name}.png`
-  await $.process.run(['mkdir', '-p', CACHE_DIR])
+  if (info.format === 'PNG' && size <= MAX_PNG_BYTES) {
+    const { base64 } = await $.fs.read(path, { as: 'bytes' })
+    return { state: 'ready', source: { png: base64 }, width: info.width, height: info.height }
+  }
 
-  // 先限制到 1600px，还超 2 MiB 就继续缩小
-  for (const edge of [1600, 1000, 600]) {
+  const out = `${CACHE_DIR}/${await hex(`${path}:${size}`)}.png`
+  await $.process.run(['mkdir', '-p', CACHE_DIR])
+  // 逐级缩小，直到不超过单张上限
+  for (const edge of RESIZE_EDGES) {
     const r = await $.process.run([
       'convert', `${path}[0]`, '-resize', `${edge}x${edge}>`, '-strip', `png:${out}`,
     ], { timeoutMs: 60_000 })
@@ -60,7 +130,7 @@ async function toPng($: Engine, path: string): Promise<Prepared> {
   }
   const small = await identify($, out)
   const { base64 } = await $.fs.read(out, { as: 'bytes' })
-  return { state: 'ready', png: base64, width: small.width, height: small.height }
+  return { state: 'ready', source: { png: base64 }, width: small.width, height: small.height }
 }
 
 /**
@@ -95,6 +165,31 @@ function cellsOf(
     applied: atLimit ? columns / base : scale,
   }
 }
+
+// 默认展开方式（/image-view 设置，存在 $.store 里跨会话保留）：
+// auto 回复里的图展开、Read 的图折叠；on 全部展开；off 全部折叠
+type OpenMode = 'auto' | 'on' | 'off'
+const OPEN_MODES: readonly OpenMode[] = ['auto', 'on', 'off']
+const OPEN_MODE_KEY = 'defaultOpen'
+let openMode: OpenMode | undefined
+
+async function loadOpenMode($: Engine): Promise<OpenMode> {
+  if (openMode) return openMode
+  const stored = await $.store.get(OPEN_MODE_KEY)
+  openMode = OPEN_MODES.find(m => m === stored) ?? 'auto'
+  return openMode
+}
+
+async function defaultOpen($: Engine, kind: 'read' | 'reply'): Promise<boolean> {
+  const mode = await loadOpenMode($)
+  return mode === 'auto' ? kind === 'reply' : mode === 'on'
+}
+
+const describeMode = (mode: OpenMode) => ({
+  auto: '图片默认展开方式：auto（回复里的图片展开，Read 的图片折叠）',
+  on: '图片默认展开方式：on（全部默认展开）',
+  off: '图片默认展开方式：off（全部默认折叠）',
+})[mode]
 
 const prepared = new Map<string, Prepared>()
 // 每个图片块的展开状态；没有记录时用该块的默认值
@@ -131,6 +226,8 @@ function imageBlock(
   path: string,
   alt: string,
   openByDefault: boolean,
+  budget: Budget,
+  onScreen: OnScreen,
 ) {
   const { Box, Text, Button, Image } = $.ui.resolve(e)
   const open = expanded.get(id) ?? openByDefault
@@ -141,11 +238,20 @@ function imageBlock(
 
   let body = null
   let controls = null
-  if (open && p?.state === 'ready') {
+  // 只有 inline 来源的 base64 会进渲染树、占预算；file 来源只是一个路径
+  const cost = p?.state === 'ready' && 'png' in p.source ? p.source.png.length : 0
+  if (open && p?.state === 'ready' && cost > 0 && onScreen === null) {
+    // 滚出视口：inline 图不进渲染树（终端会按上次的行数占位），滚回来时本消息会重绘
+    body = <Text dimColor>图片在视口外，滚动到这里时显示</Text>
+  } else if (open && p?.state === 'ready' && cost > budget.left) {
+    // 引擎会丢掉超过预算的整棵树，所以这张不画，让已画的几张照常显示
+    body = <Text dimColor>本条消息里的图片总量已达显示上限（{TREE_IMAGE_BUDGET >> 20} MiB），这张暂不显示；收起其他图片后再展开</Text>
+  } else if (open && p?.state === 'ready') {
+    budget.left -= cost
     const { columns, rows, atLimit, applied } = cellsOf(
       p.width, p.height, e.viewport?.columns, e.viewport?.rows, scale)
     body = (
-      <Image key={`img:${id}`} source={{ png: p.png }} columns={columns} rows={rows}
+      <Image key={`img:${id}`} source={p.source} columns={columns} rows={rows}
         alt={`[图片 ${alt || basename(path)} ${p.width}×${p.height}]`} />
     )
     controls = (
@@ -192,10 +298,11 @@ export const register: Register = on => {
     const path = imageReadPath(tool, input)
     if (!path || isRunning || isErrored) return drawn
     const { Box } = $.ui.resolve(e)
+    const open = await defaultOpen($, 'read')
     return (
       <Box flexDirection="column">
         {drawn}
-        {imageBlock($, e, tool_use_id, path, '', false)}
+        {imageBlock($, e, tool_use_id, path, '', open, newBudget(), onScreenOf(e.props))}
       </Box>
     )
   })
@@ -204,10 +311,12 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
     const drawn = await next(e)
     if (e.surface !== 'terminal' || e.props.isExpanded) return drawn
+    const budget = newBudget()
+    const open = await defaultOpen($, 'read')
     const blocks = e.props.calls.flatMap((c, i) => {
       const path = imageReadPath(c.tool, c.input)
       if (!path || c.isRunning || c.isErrored) return []
-      return [imageBlock($, e, c.tool_use_id ?? `${e.requestId}:${i}`, path, '', false)]
+      return [imageBlock($, e, c.tool_use_id ?? `${e.requestId}:${i}`, path, '', open, budget, onScreenOf(e.props))]
     })
     if (blocks.length === 0) return drawn
     const { Box } = $.ui.resolve(e)
@@ -227,8 +336,12 @@ export const register: Register = on => {
       .map(m => ({ alt: m[1] ?? '', raw: m[2] ?? m[3] ?? '' }))
       .filter(m => IMAGE_EXT.test(m.raw) && !/^https?:/i.test(m.raw))
     if (found.length === 0) return drawn
-    const blocks = await Promise.all(found.map(async (m, i) =>
-      imageBlock($, e, `${e.requestId}:${i}`, await resolvePath($, m.raw), m.alt, true)))
+    const budget = newBudget()
+    const open = await defaultOpen($, 'reply')
+    // 先解析完路径再依次画，预算按出现顺序扣
+    const paths = await Promise.all(found.map(m => resolvePath($, m.raw)))
+    const blocks = found.map((m, i) =>
+      imageBlock($, e, `${e.requestId}:${i}`, paths[i]!, m.alt, open, budget, onScreenOf(e.props)))
     const { Box } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
@@ -236,6 +349,43 @@ export const register: Register = on => {
         {blocks}
       </Box>
     )
+  })
+
+  // /image-view [on|off|auto]：设置图片默认展开还是折叠；不带参数显示当前设置
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'image-view',
+      description: '设置图片默认展开(on)、折叠(off)或自动(auto)；不带参数显示当前设置',
+      argumentHint: '[on|off|auto]',
+    })
+    return next(e)
+  })
+
+  on('command.run', { command: 'image-view' }, async ($, e) => {
+    const [first = '', second = ''] = e.args.trim().toLowerCase().split(/\s+/)
+    const usage = '用法：/image-view on|off|auto　　/image-view source auto|file|inline'
+    const current = await loadOpenMode($)
+    const currentSource = await loadSourceMode($)
+    if (first === '') return { text: `${describeMode(current)}\n图片来源：${currentSource}\n${usage}` }
+
+    if (first === 'source') {
+      const picked = SOURCE_MODES.find(m => m === second)
+      if (!picked) return { text: `未知参数 "${second}"。${usage}\n图片来源：${currentSource}` }
+      await $.store.set(SOURCE_MODE_KEY, picked)
+      sourceMode = picked
+      prepared.clear() // 重新按新来源准备
+      $.ui.invalidate('ui.render')
+      return { text: describeSource(picked) }
+    }
+
+    const mode = OPEN_MODES.find(m => m === first)
+    if (!mode) return { text: `未知参数 "${first}"。${usage}\n${describeMode(current)}` }
+    await $.store.set(OPEN_MODE_KEY, mode)
+    openMode = mode
+    // 已手动展开/收起的块也回到新的默认值
+    expanded.clear()
+    $.ui.invalidate('ui.render')
+    return { text: describeMode(mode) }
   })
 
   // 告诉模型：交付图片时用 Markdown 图片语法引用本地绝对路径，终端会直接显示
