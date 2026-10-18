@@ -78,7 +78,8 @@ async function loadSourceMode($: Engine): Promise<SourceMode> {
 async function useInline($: Engine): Promise<boolean> {
   const mode = await loadSourceMode($)
   if (mode !== 'auto') return mode === 'inline'
-  const r = await $.process.run(['sh', '-c', 'printf %s "$SSH_CONNECTION$SSH_TTY"'])
+  // webterm（浏览器里的 xterm.js）只支持直接传输，读不到本机文件，和 ssh 一样走 inline
+  const r = await $.process.run(['sh', '-c', 'printf %s "$SSH_CONNECTION$SSH_TTY$WEBTERM_SESSION"'])
   return r.exitCode === 0 && r.stdout.trim() !== ''
 }
 
